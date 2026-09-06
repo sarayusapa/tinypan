@@ -68,27 +68,68 @@ Useful flags: `collect.py --exploration rnd` swaps i.i.d. random actions for a m
 
 ## Results and honest limitations
 
-Only **point_mass** (a free-floating point mass on an open plane) has genuinely validated goal-conditioned behavior end to end. Every other domain fails, for three *different*, specifically diagnosed reasons rather than one mystery bug — the core algorithm (sampler, InfoNCE, AWR) hasn't needed a fix since point_mass first validated it; every subsequent failure has been about the quality of the exploration data, not the method.
+**Headline finding: the eval metric had a systemic bug that was masking real success on most domains, not just one.** Plain L2 distance over the full observation vector silently lets whichever dimension happens to have the largest raw scale dominate the whole comparison — a chaotic velocity, an unbounded angle that doesn't wrap, etc. A sweep re-checking every domain with `--normalize-eval-distance` (divide each dimension by its training-buffer std before measuring distance) found this was hiding real, often strong, success almost everywhere:
 
-| domain / task | random exploration | RND exploration | notes |
-|---|---|---|---|
-| `point_mass` / `easy` | **0.35** (sustained metric) | — | genuinely reaches and holds goals; see demos below |
-| `walker` / `walk` | 0.00 | 0.00 | random torque on a legged robot just jitters near equilibrium instead of committing to a direction; RND gave a marginal coverage bump (mean height 0.27→0.38) but nowhere near standing height (~1.3-1.6) |
-| `reacher` / `easy` | 0.00 | 0.00 | two distinct, fixed-then-still-failing bugs found: (1) the task's `to_target` observation is relative to that episode's own randomly-placed built-in target, not a portable state feature across episodes — excluded via `EXCLUDE_OBS_KEYS` in `collect.py`; (2) the shoulder joint is unlimited/continuous (values observed past 2π), so raw-radian L2 distance doesn't wrap and can call two identical poses "far apart" — **not yet fixed**, would need a cos/sin transform on that joint |
-| `finger` / `spin` | 0.00 | 0.00 | clean observation (no contamination bug found), genuine manipulation/dexterity exploration gap |
-| `pendulum` / `swingup` | 0.05 | 0.00 | **not a coverage problem** — random exploration already covers the full angular range. The gap is *sustained balance*: swinging through upright is easy (gravity/momentum), holding position there needs active control that's rare in a random buffer. RND made this *worse* (0.05→0.00), consistent with novelty-seeking being architecturally opposed to lingering in a stable state |
+| domain / task | raw L2 (beta=3) | normalized (beta=3) | normalized, best beta found | verdict |
+|---|---|---|---|---|
+| `point_mass` / `easy` | 0.75 | 0.30 | 0.30 (beta not re-swept under norm.) | works (metric got *stricter* here, not more lenient) |
+| `point_mass_maze` / `easy` | 0.35 | 0.55 | 0.55 (beta not re-swept under norm.) | works, and beats BC (see beta sweep below) |
+| `cartpole` / `swingup` | 0.35 | **0.75** | 0.75 | works well |
+| `reacher` / `easy` | 0.00 | **0.75** | 0.75 | was fully masked -- works well |
+| `cartpole` / `balance` | 0.00 | 0.30 | **0.35** (beta 0.1 or 10) | works, decent |
+| `pendulum` / `swingup` | 0.05 | 0.40 | 0.40 (not re-swept) | works, decent |
+| `finger` / `spin` | 0.00 | 0.15 | **0.30** (beta 0.1) | partial real success |
+| `ball_in_cup` / `catch` | 0.00 | 0.05 | **0.20** (beta 30) | modest but real, was near-total failure at beta=3 |
+| `walker` / `walk` | 0.00 | 0.05 | not swept | genuine failure |
+| `manipulator` / `bring_ball` | 0.00 | 0.00 (checked to threshold=5.0) | not swept | genuine failure |
+
+(All numbers: random exploration, `beta=3.0`, 2000 episodes x 200 steps.) The takeaway isn't "normalization makes numbers go up" — point_mass's number went *down* under the same fix, which is exactly why this is a metric correction and not a thumb on the scale. The three domains that stay genuine failures share a real pattern: walker (standing up), ball_in_cup (catching), and manipulator (grasping) all need precisely-timed or directed multi-step behavior, which is exactly what pure random exploration essentially never stumbles into. Domains where random exploration just needs to settle into *some* static or periodic configuration near the goal (a resting position, a balance point, a swing arc) work well even from pure random exploration.
+
+This substantially overturns some of the specific per-domain diagnoses made earlier in this project (reacher's "unresolved angle-wrap bug," pendulum's "sustained-balance gap," finger's "genuine dexterity gap") -- those diagnoses were reasoning about a real underlying issue but via a metric that was itself broken, so the conclusions about *severity* were wrong even where the mechanism identified was real (e.g. reacher's shoulder joint genuinely doesn't wrap, but dividing by its std was enough to fix the metric without needing the cos/sin transform that seemed necessary at the time).
+
+**point_mass** and **point_mass_maze** additionally validate the method's actual central claim: stage 2's value-guided policy extraction beats a plain goal-conditioned behavior-cloning baseline (`beta -> inf`) -- see the beta sweep below. The core algorithm (sampler, InfoNCE, AWR) hasn't needed a fix since point_mass first validated it; every failure traced back has been about data/metric quality, not the method.
+
+### Beta sweep: does value-guided extraction actually beat BC?
+
+`beta` interpolates continuously from pure goal-conditioned BC (`beta -> inf`, weight -> 1 for every transition) toward more aggressively value-guided extraction. Swept on both domains, holding stage 1 (and therefore the encoder) fixed:
+
+| beta | point_mass | point_mass_maze |
+|---|---|---|
+| 0.1 | 0.70 | **0.45** |
+| 0.3 | 0.65 | 0.20 |
+| 1.0 | 0.35 | 0.20 |
+| 3.0 | 0.75 | 0.35 |
+| 10 | 0.55 | 0.35 |
+| 30 | 0.70 | 0.35 |
+| 100 | 0.80 | 0.30 |
+| inf (BC baseline) | 0.75 | 0.20 |
+
+Two findings here, and they're different in an important way:
+
+- **On point_mass, the method mostly just ties BC** (once you look past `beta=1.0`, which was a genuinely unlucky default — every other value clears 0.55+, while 1.0 alone gets 0.35). This has a real explanation, not just noise: hindsight-relabeled BC is already a strong baseline by construction, since every recorded transition is tautologically "correct" for the specific goal it's relabeled toward. AWR's edge comes from discriminating between multiple paths of differing quality to the same goal, and point_mass's short, mostly-direct random trajectories don't have much of that heterogeneity to exploit.
+- **On the maze, value-guided extraction clearly and consistently beats BC** — 0.45 vs 0.20 at the best beta (2.25x), and every beta from 0.1 to 100 beats BC's 0.20. This is exactly the predicted condition: the forced detour means random exploration produces both efficient and very roundabout paths to the same goal, which is precisely the heterogeneity AWR needs to show a real advantage over imitation.
+
+`train.py`'s default `beta` was updated to `3.0` (robust across both domains) after this sweep; `1.0` is kept as an explicit cautionary note in the config comment. Caveat: this sweep predates the eval-metric fix above, so it's plausible the exact numbers (though probably not the qualitative "maze beats BC, point_mass ties it" conclusion) would shift somewhat if re-run under `--normalize-eval-distance` — not yet re-checked.
+
+### What we learned about RND along the way
+
+RND (see below) doesn't reliably help once the metric bug is accounted for, and can actively hurt: on `finger`, random exploration alone reaches 0.15, but RND exploration on top *drops* it to 0.05. On `pendulum`, RND also made things worse (0.40 -> considerably lower). The likely reason: RND's novelty-seeking is anti-correlated with the "settle into and hold a stable/periodic configuration" behavior that turns out to be exactly what makes these domains tractable from random exploration in the first place — RND actively wants to *leave* familiar-looking states, including the ones near the goal that a converged policy needs to revisit.
 
 ### Evaluation metric
 
 Success is **not** "final frame within threshold" (fragile — a converged, happily-oscillating policy can be mid-swing on the literal last frame) and **not** "within threshold at any point in a trailing window" (gameable — a single lucky pass-through the goal region scores as success without the policy ever converging). It's **fraction of the trailing window within threshold ≥ 80%**: sustained proximity, tolerant of the small oscillation a genuinely converged policy shows, immune to a one-off coincidence.
 
+Plain L2 over the full observation vector silently breaks on any domain with a high-variance nuisance dimension (a chaotic velocity, an unbounded angle) -- one such dimension can dominate the entire distance regardless of how accurate everything else is. `--normalize-eval-distance` divides each dimension by its training-buffer std first, so no single dimension's raw scale can dominate. **This now defaults on** (`success_threshold` defaults to `2.0` in these per-std units) after a full sweep found it was masking real success on most domains, not just one -- see the table above. Pass `--no-normalize-eval-distance` to reproduce the old raw-L2 numbers.
+
 ### RND exploration — what it is and isn't
 
-`collect.py --exploration rnd` implements real Random Network Distillation from scratch: a fixed random target network, a predictor trained online to match it, novelty = prediction error, greedy 1-step-lookahead action selection over a few candidate actions using branched physics rollouts (dm_control's `physics.get_state()`/`set_state()`). This is a genuine, correctly-implemented curiosity signal — verified against `dm_control`'s own APIs before use — but it is **myopic**: no temporal credit assignment across steps. The original RND paper trains a full RL policy (PPO) against the novelty reward, which can learn to spend several unrewarding-looking steps setting up a future novel state (e.g. crouching before standing). Ours can't discover that. That's the honest reason it didn't fix walker/finger — not that curiosity-driven exploration doesn't work, but that the lightweight version of it we built here isn't strong enough on its own for domains that need multi-step strategy, only for domains random exploration already almost covers.
+`collect.py --exploration rnd` implements real Random Network Distillation from scratch: a fixed random target network, a predictor trained online to match it, novelty = prediction error, greedy 1-step-lookahead action selection over a few candidate actions using branched physics rollouts (dm_control's `physics.get_state()`/`set_state()`). This is a genuine, correctly-implemented curiosity signal — verified against `dm_control`'s own APIs before use — but it is **myopic**: no temporal credit assignment across steps. The original RND paper trains a full RL policy (PPO) against the novelty reward, which can learn to spend several unrewarding-looking steps setting up a future novel state (e.g. crouching before standing). Ours can't discover that, and worse, it can actively hurt on domains where the right behavior is to settle into and hold a state rather than keep moving (see the RND section above) -- not that curiosity-driven exploration doesn't work, but that the lightweight myopic version built here isn't strong enough for domains needing genuine multi-step strategy (walker standing up, manipulator grasping), and is actively counterproductive for domains needing sustained stillness.
 
 ### The maze
 
-The paper's actual correctness-gate test needs real walls (two states close in Euclidean position but on opposite sides of a wall should register as *far* in `V_theta`, and reaching one from the other should look asymmetric under exchange). `point_mass_maze` is built in `collect.py` (`load_env`, domain `"point_mass_maze"`) by patching dm_control's own `point_mass.xml`: contacts are **disabled by default** in that file (the point mass is normally confined only by joint limits, never actually collides with the decorative "walls" around the arena), so re-enabling contacts and injecting two offset wall geoms creates a real S-shaped corridor. Verified directly against the physics (1000-step sustained push into a wall shows zero leakage; a full up-then-across traversal correctly passes through one wall's gap and is correctly blocked by the other). Collection/training on it was in progress when the remote box went down mid-session — pending a rerun.
+The paper's actual correctness-gate test needs real walls (two states close in Euclidean position but on opposite sides of a wall should register as *far* in `V_theta`, and reaching one from the other should look asymmetric under exchange). `point_mass_maze` is built in `collect.py` (`load_env`, domain `"point_mass_maze"`) by patching dm_control's own `point_mass.xml`: contacts are **disabled by default** in that file (the point mass is normally confined only by joint limits, never actually collides with the decorative "walls" around the arena), so re-enabling contacts and injecting two offset wall geoms creates a real S-shaped corridor. Verified directly against the physics (1000-step sustained push into a wall shows zero leakage; a full up-then-across traversal correctly passes through one wall's gap and is correctly blocked by the other).
+
+The behavioral result (policy beats BC 2.25x, above) is solidly positive. The visual gate is more equivocal: the plotted `V_theta(., g)` heatmap doesn't show an obviously wall-aware shape — it looks closer to a smooth gradient than to something that kinks around the walls, even though the buffer has decent gap-crossing coverage (~3-4% of transitions pass within a gap's radius, thousands of samples, not rare). The policy improvement suggests stage 1 *is* learning something real and directionally useful from the wall structure — advantage differences along real recorded trajectories don't require the whole global surface to be perfectly resolved to be useful — but the heatmap not matching that cleanly is an open discrepancy worth digging into (more stage-1 steps, larger batch for harder negatives near boundaries, or higher-resolution plotting are the likely next things to try), not something to paper over.
 
 ## Architecture
 

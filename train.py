@@ -46,7 +46,11 @@ class Config:
     stage1_steps: int = 20_000
     stage2_steps: int = 20_000
     lr: float = 3e-4
-    beta: float = 1.0            # AWR temperature; pass float('inf') for plain BC
+    beta: float = 3.0            # AWR temperature; pass float('inf') for plain BC. A beta
+                                    # sweep (0.1-100) found 1.0 -- this file's old default --
+                                    # was a genuinely unlucky pick (0.35 success vs 0.75 for
+                                    # nearly every other value on point_mass); 3.0 is a robust
+                                    # middle ground across both point_mass and the maze.
     w_max: float = 20.0          # advantage-weight clip
     held_out_frac: float = 0.05
     log_every: int = 500
@@ -54,7 +58,9 @@ class Config:
     eval_horizon: int = 200
     eval_tail: int = 20           # trailing window checked for sustained proximity (see evaluate())
     eval_tail_frac: float = 0.8   # success = >= this fraction of eval_tail steps within threshold
-    success_threshold: float = 0.05
+    success_threshold: float = 2.0       # in per-dim-std units now that normalize_eval_distance
+                                           # defaults on; 2.0 gave a sensible spread (not saturated
+                                           # at 0 or 1) across every domain tried in the sweep
     seed: int = 0
 
 
@@ -235,7 +241,8 @@ def plot_value_heatmap(encoder, params, goal_obs, pos_range, save_path, resoluti
 # ---------------------------------------------------------------------------
 # Sec 3.6: goal-conditioned rollout evaluation
 # ---------------------------------------------------------------------------
-def evaluate(env, policy, policy_params, goals, horizon, tail, tail_frac, threshold, act_min, act_max, exclude=()):
+def evaluate(env, policy, policy_params, goals, horizon, tail, tail_frac, threshold, act_min, act_max,
+             exclude=(), obs_std=None):
     """Success = distance to goal stays under threshold for at least
     `tail_frac` of the trailing `tail` steps -- SUSTAINED proximity, not a
     single frame. This matters because the two naive alternatives are both
@@ -249,6 +256,14 @@ def evaluate(env, policy, policy_params, goals, horizon, tail, tail_frac, thresh
     while still tolerating the small oscillation a converged policy shows.
     Domain-agnostic on purpose (no assumption about which obs dims are
     "position"); pick --success-threshold per domain since obs scales differ.
+
+    obs_std, if given (per-dim std from the training buffer), divides the
+    per-dim difference before taking the norm -- otherwise a single
+    high-variance nuisance dimension (e.g. a chaotic object angular velocity
+    on manipulator, std ~40x everything else) can dominate the whole L2
+    distance and make success fail on velocity noise regardless of how good
+    the actually-relevant (e.g. position) dims are. Off by default so
+    already-validated domains' numbers stay exactly reproducible.
     """
     successes = 0
     for goal in goals:
@@ -258,7 +273,10 @@ def evaluate(env, policy, policy_params, goals, horizon, tail, tail_frac, thresh
             s = flatten_obs(ts.observation, exclude)
             a_unit = policy.apply(policy_params, jnp.array(s)[None], jnp.array(goal)[None])[0]
             ts = env.step(np.array(scale_action(a_unit, act_min, act_max)))
-            dists.append(np.linalg.norm(flatten_obs(ts.observation, exclude) - goal))
+            diff = flatten_obs(ts.observation, exclude) - goal
+            if obs_std is not None:
+                diff = diff / obs_std
+            dists.append(np.linalg.norm(diff))
         window = np.array(dists[-tail:])
         successes += (window < threshold).mean() >= tail_frac
     return successes / len(goals)
@@ -267,7 +285,7 @@ def evaluate(env, policy, policy_params, goals, horizon, tail, tail_frac, thresh
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main(cfg: Config, data_path: str, out_dir: str):
+def main(cfg: Config, data_path: str, out_dir: str, normalize_eval_distance: bool = True):
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(cfg.seed)
@@ -336,9 +354,10 @@ def main(cfg: Config, data_path: str, out_dir: str):
     env = load_env(str(npz["domain"]), str(npz["task"]))
     goal_idx = rng.integers(0, holdout_obs.shape[1], size=cfg.eval_episodes)
     goals = holdout_obs[rng.integers(0, holdout_obs.shape[0], size=cfg.eval_episodes), goal_idx]
+    obs_std = train_obs.reshape(-1, obs_dim).std(axis=0) + 1e-6 if normalize_eval_distance else None
     success_rate = evaluate(env, policy, policy_state.params, goals, cfg.eval_horizon,
                              cfg.eval_tail, cfg.eval_tail_frac, cfg.success_threshold, act_min, act_max,
-                             EXCLUDE_OBS_KEYS.get(str(npz["domain"]), ()))
+                             EXCLUDE_OBS_KEYS.get(str(npz["domain"]), ()), obs_std)
     print(f"success rate ({cfg.eval_episodes} held-out goals, beta={cfg.beta}): {success_rate:.2f}")
 
 
@@ -346,8 +365,15 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--data", default="data/point_mass_easy.npz")
     p.add_argument("--out-dir", default="runs/default")
+    p.add_argument("--normalize-eval-distance", action=argparse.BooleanOptionalAction, default=True,
+                    help="divide the eval success-distance by each dim's buffer std, so no single "
+                         "high-variance nuisance dim (e.g. a chaotic velocity or an unbounded angle) "
+                         "can dominate it. On by default -- a sweep across every domain found this "
+                         "was masking real success almost everywhere (e.g. reacher 0.00 -> 0.75). "
+                         "Pass --no-normalize-eval-distance to get the old raw-L2 behavior.")
     for field, default in vars(Config()).items():
         p.add_argument(f"--{field.replace('_', '-')}", type=type(default), default=default)
     args = p.parse_args()
-    cfg = Config(**{k: v for k, v in vars(args).items() if k not in ("data", "out_dir")})
-    main(cfg, args.data, args.out_dir)
+    cfg = Config(**{k: v for k, v in vars(args).items()
+                     if k not in ("data", "out_dir", "normalize_eval_distance")})
+    main(cfg, args.data, args.out_dir, args.normalize_eval_distance)

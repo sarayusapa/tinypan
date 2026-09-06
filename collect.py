@@ -34,7 +34,10 @@ from dm_control import suite
 # description comparable across episodes), so such keys are excluded from
 # what we treat as "state" -- verified for reacher that position == qpos, so
 # dropping to_target leaves a clean physical-state representation.
-EXCLUDE_OBS_KEYS = {"reacher": {"to_target"}}
+EXCLUDE_OBS_KEYS = {
+    "reacher": {"to_target"},
+    "manipulator": {"target_pos"},  # verified: randomized per episode, same as reacher's to_target
+}
 
 
 def flatten_obs(obs_dict, exclude=()) -> np.ndarray:
