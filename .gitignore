@@ -1,0 +1,14 @@
+# generated data/results -- all regenerable via collect.py / train.py / render.py
+data/
+runs/
+videos/
+
+# python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+
+# OS
+.DS_Store
