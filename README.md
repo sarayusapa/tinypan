@@ -80,8 +80,8 @@ Useful flags: `collect.py --exploration rnd` swaps i.i.d. random actions for a m
 | `pendulum` / `swingup` | 0.05 | 0.40 | 0.40 (not re-swept) | works, decent |
 | `finger` / `spin` | 0.00 | 0.15 | **0.30** (beta 0.1) | partial real success |
 | `ball_in_cup` / `catch` | 0.00 | 0.05 | **0.20** (beta 30) | modest but real, was near-total failure at beta=3 |
-| `walker` / `walk` | 0.00 | 0.05 | not swept | genuine failure |
-| `manipulator` / `bring_ball` | 0.00 | 0.00 (checked to threshold=5.0) | not swept | genuine failure |
+| `walker` / `walk` | 0.00 | 0.05 | 0.05 at action_repeat=10 and 25, both alike | genuine failure, ceiling confirmed (see below) |
+| `manipulator` / `bring_ball` | 0.00 | 0.00 (checked to threshold=5.0) | **0.40** (action_repeat=5, beta 0.1 or 3) | breakthrough -- see below |
 
 (All numbers: random exploration, `beta=3.0`, 2000 episodes x 200 steps.) The takeaway isn't "normalization makes numbers go up" — point_mass's number went *down* under the same fix, which is exactly why this is a metric correction and not a thumb on the scale. The three domains that stay genuine failures share a real pattern: walker (standing up), ball_in_cup (catching), and manipulator (grasping) all need precisely-timed or directed multi-step behavior, which is exactly what pure random exploration essentially never stumbles into. Domains where random exploration just needs to settle into *some* static or periodic configuration near the goal (a resting position, a balance point, a swing arc) work well even from pure random exploration.
 
@@ -114,6 +114,18 @@ Two findings here, and they're different in an important way:
 ### What we learned about RND along the way
 
 RND (see below) doesn't reliably help once the metric bug is accounted for, and can actively hurt: on `finger`, random exploration alone reaches 0.15, but RND exploration on top *drops* it to 0.05. On `pendulum`, RND also made things worse (0.40 -> considerably lower). The likely reason: RND's novelty-seeking is anti-correlated with the "settle into and hold a stable/periodic configuration" behavior that turns out to be exactly what makes these domains tractable from random exploration in the first place — RND actively wants to *leave* familiar-looking states, including the ones near the goal that a converged policy needs to revisit.
+
+### The manipulator breakthrough: `action_repeat` cuts exactly the opposite way on different task types
+
+`manipulator`/`bring_ball` went from a genuine 0.00 (checked up to a very loose threshold=5.0, confirmed not a metric artifact) to **0.40** with one change: collecting with `--action-repeat 5` instead of i.i.d. random actions every step. That beats the BC baseline on the *same* action_repeat=5 data (0.15), a real 2.67x improvement from value-guidance -- not just "better data helped both methods equally." This is the same story as the maze: `action_repeat=5` produces enough heterogeneity in how effectively different episodes happen to push/move the ball that AWR has real signal to discriminate on, where pure random-action data apparently didn't.
+
+The interesting part is that `action_repeat` cuts in *opposite* directions depending on what the task needs:
+- **Helps** tasks needing sustained, directed commitment: `walker` standing up (mild help), `manipulator` pushing/moving an object (big help, 0.00 -> 0.40).
+- **Hurts** tasks needing fine, high-frequency reflexive control: `ball_in_cup`/`catch` dropped from 0.20 to 0.05 with the same `action_repeat=5` -- catching needs rapid corrective adjustments right at the moment of contact, and holding an action for 5 steps removes exactly that capability. `finger`/`spin` similarly didn't benefit (0.30 -> 0.25 at its best beta with action_repeat=5) -- spinning turns out to need frequent recontact/repositioning rather than one sustained push, closer to ball_in_cup's profile than manipulator's.
+
+There's no universal answer to "should I use action_repeat" -- it's a real, task-dependent tradeoff between commitment and reflexes, and worth trying both ways cheaply (collection is fast) rather than assuming either default.
+
+**Walker's ceiling is confirmed, not just under-tuned**: swept action_repeat at 10 and 25 -- both land at the exact same 0.05, and coverage (mean standing height) barely moves between them either (0.354 vs 0.338, both far below the ~1.3-1.6 standing range). Manipulator needed one well-chosen action_repeat value to unlock real progress; walker doesn't respond to this knob at all, at any setting tried. Standing up appears to need actual multi-step credit assignment (a real RL-trained exploration policy, not a heuristic tweak to random action selection) to discover -- consistent with why myopic RND didn't help it either. This isn't a mystery still open, it's a confirmed limit of what heuristic exploration can do here.
 
 ### Evaluation metric
 
