@@ -35,7 +35,7 @@ def label(frame, lines, color=(255, 255, 0)):
     return np.array(img)
 
 
-def main(data_path, run_dir, episodes, horizon, tail, threshold, fps, out_dir):
+def main(data_path, run_dir, episodes, horizon, tail, threshold, fps, out_dir, fmt="mp4", stride=1):
     npz = np.load(data_path)
     obs, act = npz["obs"], npz["act"]
     qpos, qvel = npz["qpos"], npz["qvel"]
@@ -83,8 +83,9 @@ def main(data_path, run_dir, episodes, horizon, tail, threshold, fps, out_dir):
 
         window = np.array(dists[-tail:])
         frac_close = (window < threshold).mean() if threshold else float("nan")
-        path = out / f"{domain}_{task}_ep{ep}.mp4"
-        imageio.mimsave(path, frames, fps=fps)
+        path = out / f"{domain}_{task}_ep{ep}.{fmt}"
+        save_frames = frames[::stride]  # gif has no compression, so subsample to keep file size sane
+        imageio.mimsave(path, save_frames, fps=max(1, fps // stride))
         print(f"saved {path}  (final dist={dists[-1]:.3f}, "
               f"fraction of last {tail} steps < {threshold}: {frac_close:.2f})")
 
@@ -99,6 +100,8 @@ if __name__ == "__main__":
     p.add_argument("--success-threshold", type=float, default=0.05)
     p.add_argument("--fps", type=int, default=0, help="0 = infer from control timestep")
     p.add_argument("--out-dir", default=None)
+    p.add_argument("--format", choices=["mp4", "gif"], default="mp4")
+    p.add_argument("--stride", type=int, default=1, help="keep every Nth frame (gif has no compression)")
     args = p.parse_args()
     main(args.data, args.run, args.episodes, args.horizon, args.tail, args.success_threshold, args.fps,
-         args.out_dir or f"{args.run}/videos")
+         args.out_dir or f"{args.run}/videos", args.format, args.stride)

@@ -12,3 +12,6 @@ venv/
 
 # OS
 .DS_Store
+
+# local tooling state
+.claude/

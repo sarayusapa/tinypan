@@ -11,7 +11,13 @@ dependencies = [
     "numpy",
     "matplotlib",
     "tqdm",
+    "imageio",
+    "imageio-ffmpeg",
+    "pillow",
 ]
+
+[project.optional-dependencies]
+push_t = ["gym-pusht", "pymunk<7"]
 
 # On the training machine (4090 / CUDA), install the CUDA jax wheel instead of
 # plain "jax":

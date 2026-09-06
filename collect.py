@@ -41,7 +41,9 @@ EXCLUDE_OBS_KEYS = {
 
 
 def flatten_obs(obs_dict, exclude=()) -> np.ndarray:
-    return np.concatenate([np.ravel(v) for k, v in sorted(obs_dict.items()) if k not in exclude]).astype(np.float32)
+    if isinstance(obs_dict, dict):
+        return np.concatenate([np.ravel(v) for k, v in sorted(obs_dict.items()) if k not in exclude]).astype(np.float32)
+    return np.asarray(obs_dict, dtype=np.float32)  # push_t's obs is already a flat vector
 
 
 class RND:
@@ -130,11 +132,106 @@ def _point_mass_maze_env(seed):
     return control.Environment(physics, task, time_limit=point_mass._DEFAULT_TIME_LIMIT)
 
 
+class _GymTimeStep:
+    """Enough of dm_control's TimeStep for the rest of this codebase to not
+    care whether it's talking to dm_control or a gymnasium env."""
+    def __init__(self, observation, done):
+        self.observation = observation
+        self._done = done
+
+    def last(self):
+        return self._done
+
+
+class _BoxSpec:
+    """dm_control's action_spec() shape, backed by a gymnasium Box."""
+    def __init__(self, box):
+        self.shape = box.shape
+        self.minimum = box.low
+        self.maximum = box.high
+
+
+class _PushTPhysics:
+    """Just enough of dm_control's Physics interface for collect.py's qpos/
+    qvel recording and render.py's goal-teleport trick to work unchanged.
+    push_t's "physics" is two pymunk bodies (agent, block); qpos/qvel here
+    are just [agent_xy, block_xy, block_angle] and their time-derivatives,
+    packed the same way dm_control would pack a qpos/qvel pair."""
+    def __init__(self, raw_env):
+        self._raw = raw_env
+        self.data = argparse.Namespace(qpos=None, qvel=None)
+        self.model = argparse.Namespace(nq=5, nv=5)
+        self.sync()
+
+    def sync(self):
+        u = self._raw
+        self.data.qpos = np.array([*u.agent.position, *u.block.position, u.block.angle], dtype=np.float64)
+        self.data.qvel = np.array([*u.agent.velocity, *u.block.velocity, u.block.angular_velocity], dtype=np.float64)
+
+    def get_state(self):
+        return np.concatenate([self.data.qpos, self.data.qvel]).copy()
+
+    def set_state(self, state):
+        self.data.qpos[:], self.data.qvel[:] = state[:5], state[5:]
+        self.forward()
+
+    def forward(self):
+        """Pushes self.data.qpos/qvel (possibly just slice-assigned by a
+        caller, dm_control-style) back into the actual pymunk bodies."""
+        u = self._raw
+        qpos, qvel = self.data.qpos, self.data.qvel
+        u.agent.position, u.block.position, u.block.angle = tuple(qpos[0:2]), tuple(qpos[2:4]), float(qpos[4])
+        u.agent.velocity, u.block.velocity, u.block.angular_velocity = tuple(qvel[0:2]), tuple(qvel[2:4]), float(qvel[4])
+
+    def render(self, height, width, camera_id=0):
+        from PIL import Image
+        return np.array(Image.fromarray(self._raw.render()).resize((width, height)))
+
+    def timestep(self):
+        return self._raw.dt
+
+
+class _PushTEnv:
+    """Adapts gym-pusht's Gymnasium API to the dm_control-shaped interface
+    the rest of this codebase expects. Random exploration only: RND's
+    branched-physics lookahead would need to replicate push_t's internal PD
+    control loop exactly, which isn't done here."""
+    def __init__(self, gym_env):
+        self._env = gym_env
+        self.physics = _PushTPhysics(gym_env.unwrapped)
+
+    def action_spec(self):
+        return _BoxSpec(self._env.action_space)
+
+    def reset(self):
+        obs, _ = self._env.reset()
+        self.physics.sync()
+        return _GymTimeStep(obs, False)
+
+    def step(self, action):
+        obs, _, terminated, truncated, _ = self._env.step(action)  # reward discarded, same as everywhere else
+        self.physics.sync()
+        return _GymTimeStep(obs, terminated or truncated)
+
+    def control_timestep(self):
+        return 1.0 / self._env.unwrapped.control_hz
+
+
+def _push_t_env(seed):
+    import gymnasium as gym
+    import gym_pusht  # noqa: F401 -- registers the gym_pusht/PushT-v0 env id
+    gym_env = gym.make("gym_pusht/PushT-v0", obs_type="state", render_mode="rgb_array")
+    gym_env.reset(seed=seed)  # gymnasium seeds via reset(), not construction; later resets continue the RNG stream
+    return _PushTEnv(gym_env)
+
+
 def load_env(domain: str, task: str, seed=None):
-    """Every env construction in this codebase goes through here so the maze
-    special-case lives in one place."""
+    """Every env construction in this codebase goes through here so the
+    maze and push_t special-cases live in one place."""
     if domain == "point_mass_maze":
         return _point_mass_maze_env(seed)
+    if domain == "push_t":
+        return _push_t_env(seed)
     kwargs = {"random": seed} if seed is not None else {}
     return suite.load(domain_name=domain, task_name=task, task_kwargs=kwargs)
 
