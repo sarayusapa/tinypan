@@ -1,19 +1,8 @@
-"""tinypan: contrastive goal-conditioned RL, end to end, in one file.
-
-Method (see docstring sections below for the matching paper section):
-  Stage 1 (Sec 3.4) -- contrastive value learning, no actions, no rewards:
-      V_theta(s, g) = <f_theta(s), h_theta(g)> / sqrt(d)
-      fit by symmetric InfoNCE against hindsight-relabeled goals drawn with
-      a geometric horizon (Sec 3.2-3.4).
-  Stage 2 (Sec 3.5) -- advantage-weighted action decoding, theta FROZEN:
-      A(s, a, g) = V_theta(s', g) - V_theta(s, g)
-      pi_psi fit by advantage-weighted regression against recorded actions.
-
-theta is frozen at exactly the boundary between the two stages: stage 2
-reads it only as a numerical weight, no gradient crosses that line.
+"""Contrastive goal-conditioned RL, end to end, in one file. See README.md
+for the method and the reasoning behind these defaults.
 
 Usage:
-    python collect.py                              # build a reward-free buffer
+    python collect.py
     python train.py --data data/point_mass_easy.npz
 """
 import argparse
@@ -38,29 +27,24 @@ from collect import EXCLUDE_OBS_KEYS, flatten_obs, load_env
 # ---------------------------------------------------------------------------
 @dataclass
 class Config:
-    gamma: float = 0.95          # discount, implemented via the horizon sampler (Sec 3.4)
-    dim: int = 64                # embedding dim d
+    gamma: float = 0.95
+    dim: int = 64
     hidden: int = 256
     depth: int = 2
-    batch_size: int = 512        # paper's B
+    batch_size: int = 512
     stage1_steps: int = 20_000
     stage2_steps: int = 20_000
     lr: float = 3e-4
-    beta: float = 3.0            # AWR temperature; pass float('inf') for plain BC. A beta
-                                    # sweep (0.1-100) found 1.0 -- this file's old default --
-                                    # was a genuinely unlucky pick (0.35 success vs 0.75 for
-                                    # nearly every other value on point_mass); 3.0 is a robust
-                                    # middle ground across both point_mass and the maze.
-    w_max: float = 20.0          # advantage-weight clip
+    beta: float = 3.0            # AWR temperature; float('inf') for plain BC. No fixed value
+                                    # works everywhere, see README's Parameters table.
+    w_max: float = 20.0
     held_out_frac: float = 0.05
     log_every: int = 500
     eval_episodes: int = 20
     eval_horizon: int = 200
-    eval_tail: int = 20           # trailing window checked for sustained proximity (see evaluate())
-    eval_tail_frac: float = 0.8   # success = >= this fraction of eval_tail steps within threshold
-    success_threshold: float = 2.0       # in per-dim-std units now that normalize_eval_distance
-                                           # defaults on; 2.0 gave a sensible spread (not saturated
-                                           # at 0 or 1) across every domain tried in the sweep
+    eval_tail: int = 20
+    eval_tail_frac: float = 0.8
+    success_threshold: float = 2.0   # per-dimension-std units (see normalize_eval_distance)
     seed: int = 0
 
 
@@ -68,13 +52,9 @@ class Config:
 # Data: fixed-length episode buffer + geometric-horizon hindsight sampler
 # ---------------------------------------------------------------------------
 def _sample_anchor_and_goal(rng, num_episodes, L, batch_size, gamma):
-    """Anchor (e, t) and hindsight goal index (e, goal_t) for a batch.
-
-    goal_t = t + Delta, Delta ~ Geom(1 - gamma) (support {1, 2, ...}).
-    Draws that fall past the episode end are REJECTED and resampled, not
-    clipped -- clipping would concentrate positives on terminal states
-    (Sec 3.4).
-    """
+    """goal_t = t + Delta, Delta ~ Geom(1 - gamma). Draws past the episode
+    end are rejected and resampled, not clipped, since clipping would
+    concentrate positives on terminal states."""
     e = rng.integers(0, num_episodes, size=batch_size)
     t = rng.integers(0, L, size=batch_size)
     delta = rng.geometric(1 - gamma, size=batch_size)
@@ -88,14 +68,11 @@ def _sample_anchor_and_goal(rng, num_episodes, L, batch_size, gamma):
 
 
 def sample_stage1_batch(obs, rng, batch_size, gamma):
-    """(s, g) pairs: this is hindsight relabelling -- g is just whatever
-    state the behaviour policy happened to reach (Sec 3.4)."""
     e, t, goal_t = _sample_anchor_and_goal(rng, obs.shape[0], obs.shape[1] - 1, batch_size, gamma)
     return obs[e, t], obs[e, goal_t]
 
 
 def sample_stage2_batch(obs, act, rng, batch_size, gamma):
-    """(s, a, s', g) transitions, g relabeled with the same scheme as stage 1."""
     e, t, goal_t = _sample_anchor_and_goal(rng, obs.shape[0], act.shape[1], batch_size, gamma)
     return obs[e, t], act[e, t], obs[e, t + 1], obs[e, goal_t]
 
@@ -116,9 +93,8 @@ class MLP(nn.Module):
 
 
 class Encoder(nn.Module):
-    """Untied state/goal encoders f_theta, h_theta sharing a trunk (Sec 3.3).
-    Tying them would force V symmetric; the trunk is shared purely to cut
-    parameters."""
+    """Untied f_theta / h_theta sharing a trunk. Tying them would force V
+    symmetric; the trunk is shared purely to cut parameters."""
     hidden: int
     depth: int
     dim: int
@@ -134,7 +110,7 @@ class Encoder(nn.Module):
     def encode_goal(self, g):
         return self.h_head(nn.relu(self.trunk(g)))
 
-    def __call__(self, s, g):  # only used to init params for both heads at once
+    def __call__(self, s, g):  # initializes params for both heads at once
         return self.encode_state(s), self.encode_goal(g)
 
 
@@ -146,7 +122,7 @@ class Policy(nn.Module):
     @nn.compact
     def __call__(self, s, g):
         x = jnp.concatenate([s, g], axis=-1)
-        return nn.tanh(MLP(self.hidden, self.depth, self.act_dim)(x))  # unit range, rescaled outside
+        return nn.tanh(MLP(self.hidden, self.depth, self.act_dim)(x))  # rescaled outside
 
 
 def scale_action(a_unit, act_min, act_max):
@@ -154,18 +130,15 @@ def scale_action(a_unit, act_min, act_max):
 
 
 # ---------------------------------------------------------------------------
-# Stage 1: contrastive value learning (Sec 3.4)
+# Stage 1: contrastive value learning
 # ---------------------------------------------------------------------------
 def score_matrix(encoder, params, s, g):
-    """M[i, j] = V_theta(s_i, g_j), the rank-d factorisation of Sec 3.3."""
-    f = encoder.apply(params, s, method=Encoder.encode_state)  # (B, d)
-    h = encoder.apply(params, g, method=Encoder.encode_goal)   # (B, d)
+    f = encoder.apply(params, s, method=Encoder.encode_state)
+    h = encoder.apply(params, g, method=Encoder.encode_goal)
     return f @ h.T / jnp.sqrt(f.shape[-1])
 
 
 def infonce_loss(encoder, params, s, g):
-    """Eq. (3.4): symmetric InfoNCE. Off-diagonal entries of each row/column
-    are negatives -- goals belonging to other anchors in the batch."""
     M = score_matrix(encoder, params, s, g)
     labels = jnp.arange(M.shape[0])
     loss_row = optax.softmax_cross_entropy_with_integer_labels(M, labels).mean()
@@ -182,7 +155,7 @@ def make_stage1_step(encoder):
 
 
 # ---------------------------------------------------------------------------
-# Stage 2: advantage-weighted action decoding (Sec 3.5), theta frozen
+# Stage 2: advantage-weighted action decoding, theta frozen
 # ---------------------------------------------------------------------------
 def value(encoder, params, s, g):
     f = encoder.apply(params, s, method=Encoder.encode_state)
@@ -193,7 +166,7 @@ def value(encoder, params, s, g):
 def awr_loss(encoder, policy, policy_params, encoder_params, s, a, s_next, g, beta, w_max):
     advantage = jax.lax.stop_gradient(
         value(encoder, encoder_params, s_next, g) - value(encoder, encoder_params, s, g)
-    )  # log-occupancy ratio; the additive normalising constant of V cancels
+    )
     weight = jnp.minimum(jnp.exp(advantage / beta), w_max)
     a_pred = policy.apply(policy_params, s, g)
     mse = jnp.sum((a_pred - a) ** 2, axis=-1)
@@ -210,7 +183,7 @@ def make_stage2_step(encoder, policy, beta, w_max):
 
 
 # ---------------------------------------------------------------------------
-# Sec 3.6: correctness gate -- visualize V_theta(., g) on point_mass
+# Correctness gate: visualize V_theta(., g) on point_mass
 # ---------------------------------------------------------------------------
 def plot_value_heatmap(encoder, params, goal_obs, pos_range, save_path, resolution=60, walls=()):
     xs = np.linspace(*pos_range, resolution)
@@ -227,7 +200,7 @@ def plot_value_heatmap(encoder, params, goal_obs, pos_range, save_path, resoluti
                              ["V(s, g_fixed)", "V(g_fixed, s)  [asymmetry check]"]):
         im = ax.imshow(v.reshape(resolution, resolution), origin="lower",
                         extent=[*pos_range, *pos_range])
-        for (wx, wy, ww, wh) in walls:  # overlay actual maze wall geometry for reference
+        for (wx, wy, ww, wh) in walls:
             ax.add_patch(plt.Rectangle((wx, wy), ww, wh, facecolor="white", edgecolor="black", linewidth=1))
         ax.scatter([goal_obs[0]], [goal_obs[1]], c="red", marker="*", s=120)
         ax.set_title(title)
@@ -235,36 +208,17 @@ def plot_value_heatmap(encoder, params, goal_obs, pos_range, save_path, resoluti
     fig.tight_layout()
     fig.savefig(save_path, dpi=120)
     plt.close(fig)
-    print(f"[gate] saved value heatmap -> {save_path} -- eyeball this before trusting stage 2")
+    print(f"[gate] saved value heatmap -> {save_path}")
 
 
 # ---------------------------------------------------------------------------
-# Sec 3.6: goal-conditioned rollout evaluation
+# Goal-conditioned rollout evaluation
 # ---------------------------------------------------------------------------
 def evaluate(env, policy, policy_params, goals, horizon, tail, tail_frac, threshold, act_min, act_max,
              exclude=(), obs_std=None):
-    """Success = distance to goal stays under threshold for at least
-    `tail_frac` of the trailing `tail` steps -- SUSTAINED proximity, not a
-    single frame. This matters because the two naive alternatives are both
-    wrong in opposite directions:
-      - last-frame-only: a converged, oscillating policy (good conditioning)
-        can be mid-swing on the literal final frame and get a false negative.
-      - "within threshold at ANY point in the tail": satisfied by one lucky
-        pass-through the goal region, a false positive that inflates the
-        reported rate without the policy ever having actually converged.
-    Requiring most of the window to be close rules out the lucky pass-through
-    while still tolerating the small oscillation a converged policy shows.
-    Domain-agnostic on purpose (no assumption about which obs dims are
-    "position"); pick --success-threshold per domain since obs scales differ.
-
-    obs_std, if given (per-dim std from the training buffer), divides the
-    per-dim difference before taking the norm -- otherwise a single
-    high-variance nuisance dimension (e.g. a chaotic object angular velocity
-    on manipulator, std ~40x everything else) can dominate the whole L2
-    distance and make success fail on velocity noise regardless of how good
-    the actually-relevant (e.g. position) dims are. Off by default so
-    already-validated domains' numbers stay exactly reproducible.
-    """
+    """Success: distance to goal stays under threshold for tail_frac of the
+    trailing `tail` steps. obs_std, if given, standardizes each dimension
+    before measuring distance so one high-variance dimension can't dominate."""
     successes = 0
     for goal in goals:
         ts = env.reset()
@@ -301,7 +255,7 @@ def main(cfg: Config, data_path: str, out_dir: str, normalize_eval_distance: boo
     print(f"buffer: {obs.shape[0]} episodes ({obs.shape[0] - n_holdout} train / {n_holdout} held out), "
           f"obs_dim={obs_dim} act_dim={act_dim}")
 
-    # ---- Stage 1 ----
+    # Stage 1
     encoder = Encoder(hidden=cfg.hidden, depth=cfg.depth, dim=cfg.dim)
     key, sub = jax.random.split(key)
     enc_params = encoder.init(sub, jnp.zeros((1, obs_dim)), jnp.zeros((1, obs_dim)))
@@ -318,26 +272,23 @@ def main(cfg: Config, data_path: str, out_dir: str, normalize_eval_distance: boo
     with open(out / "encoder_params.pkl", "wb") as f:
         pickle.dump(enc_state.params, f)
 
-    # correctness gate (Sec 3.6) -- only meaningful for domains with a plain
-    # 2D position in the obs (point_mass family); skip elsewhere rather than
-    # assume a layout that isn't there.
+    # Correctness gate: only meaningful where obs has a plain 2D position.
     if str(npz["domain"]) in ("point_mass", "point_mass_maze"):
         goal_obs = holdout_obs[0, -1]
         pos = train_obs[..., :2]
         pos_range = (float(pos.min()) * 1.1, float(pos.max()) * 1.1)
-        # (x, y, width, height) in plot coords, matching _point_mass_maze_env's wall geoms
         walls = [(-.11, -.3, .02, .4), (.09, -.1, .02, .4)] if str(npz["domain"]) == "point_mass_maze" else ()
         plot_value_heatmap(encoder, enc_state.params, goal_obs, pos_range, out / "value_heatmap.png", walls=walls)
     else:
         print(f"[gate] skipped value heatmap -- no 2D position assumption for domain={npz['domain']}")
 
-    # ---- Stage 2 ----
+    # Stage 2
     policy = Policy(hidden=cfg.hidden, depth=cfg.depth, act_dim=act_dim)
     key, sub = jax.random.split(key)
     policy_params = policy.init(sub, jnp.zeros((1, obs_dim)), jnp.zeros((1, obs_dim)))
     policy_state = TrainState.create(apply_fn=policy.apply, params=policy_params, tx=optax.adam(cfg.lr))
     stage2_step = make_stage2_step(encoder, policy, cfg.beta, cfg.w_max)
-    frozen_enc_params = enc_state.params  # theta frozen from here on; no gradient crosses this line
+    frozen_enc_params = enc_state.params
 
     pbar = trange(cfg.stage2_steps, desc="stage2 (AWR policy)")
     for i in pbar:
@@ -350,7 +301,7 @@ def main(cfg: Config, data_path: str, out_dir: str, normalize_eval_distance: boo
     with open(out / "policy_params.pkl", "wb") as f:
         pickle.dump(policy_state.params, f)
 
-    # ---- Eval ----
+    # Eval
     env = load_env(str(npz["domain"]), str(npz["task"]))
     goal_idx = rng.integers(0, holdout_obs.shape[1], size=cfg.eval_episodes)
     goals = holdout_obs[rng.integers(0, holdout_obs.shape[0], size=cfg.eval_episodes), goal_idx]
@@ -366,11 +317,7 @@ if __name__ == "__main__":
     p.add_argument("--data", default="data/point_mass_easy.npz")
     p.add_argument("--out-dir", default="runs/default")
     p.add_argument("--normalize-eval-distance", action=argparse.BooleanOptionalAction, default=True,
-                    help="divide the eval success-distance by each dim's buffer std, so no single "
-                         "high-variance nuisance dim (e.g. a chaotic velocity or an unbounded angle) "
-                         "can dominate it. On by default -- a sweep across every domain found this "
-                         "was masking real success almost everywhere (e.g. reacher 0.00 -> 0.75). "
-                         "Pass --no-normalize-eval-distance to get the old raw-L2 behavior.")
+                    help="standardize each obs dimension before measuring eval distance")
     for field, default in vars(Config()).items():
         p.add_argument(f"--{field.replace('_', '-')}", type=type(default), default=default)
     args = p.parse_args()

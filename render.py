@@ -1,9 +1,6 @@
-"""Render goal-conditioned rollout videos from a trained tinypan policy.
-
-Shows the agent's rollout side-by-side with a static render of the actual
-goal state (teleported from raw qpos/qvel -- the task obs alone can't be
-inverted back into a scene for most domains), with the live distance-to-goal
-overlaid on every frame.
+"""Renders a trained policy's rollout side-by-side with the actual goal state
+(teleported from raw qpos/qvel, since task obs can't be inverted back into a
+scene for most domains), with the live distance-to-goal overlaid.
 
 Usage:
     python render.py --data data/point_mass_easy.npz --run runs/point_mass_easy

@@ -1,24 +1,12 @@
-"""Reward-free exploration data collection for tinypan.
+"""Reward-free exploration data collection. See README.md for the method.
 
-Stands in for an ExORL replay buffer: rolls a random policy out on a
-dm_control task and stores raw (observation, action) trajectories. No reward
-is ever read from the environment -- see Sec 3.1, "Environment rewards are
-discarded and never used."
-
-Every episode is collected for a fixed number of steps L, so the buffer is
-dense arrays:
-    obs:  (num_episodes, L + 1, obs_dim)  -- states s_0 .. s_L (task obs, used for training)
-    act:  (num_episodes, L,     act_dim)  -- actions a_0 .. a_{L-1}, where
-                                              act[e, t] is taken from obs[e, t]
-                                              and leads to obs[e, t + 1].
-    qpos/qvel: (num_episodes, L + 1, nq/nv) -- raw physics state at every step.
-        Not used for training -- task obs is often a derived/partial view of
-        physics state (e.g. walker's "orientations" aren't raw joint angles),
-        so it can't be inverted back into a renderable scene. qpos/qvel can:
-        render.py teleports a second Physics instance to a goal's qpos/qvel
-        to show what the agent was actually conditioned on.
-Fixed-length episodes keep the hindsight sampler in train.py a few lines of
-vectorized indexing instead of an offset table.
+Buffer layout (fixed-length episodes, so the sampler in train.py is plain
+vectorized indexing instead of an offset table):
+    obs:  (num_episodes, L + 1, obs_dim)
+    act:  (num_episodes, L,     act_dim)   act[e, t] takes obs[e, t] to obs[e, t + 1]
+    qpos/qvel: (num_episodes, L + 1, nq/nv) raw physics state, for render.py's
+        goal-teleport (task obs is often a derived/partial view of physics
+        state and can't be inverted back into a scene).
 """
 import argparse
 
@@ -26,39 +14,25 @@ import numpy as np
 from dm_control import suite
 
 
-# Some domains' task observation includes a feature computed relative to a
-# per-episode RANDOMIZED task parameter -- e.g. reacher's "to_target" is
-# (fingertip - that episode's randomly placed built-in target), so the same
-# physical arm pose gets a different "to_target" in different episodes. That
-# breaks the whole premise of goal-conditioning (state must be a portable
-# description comparable across episodes), so such keys are excluded from
-# what we treat as "state" -- verified for reacher that position == qpos, so
-# dropping to_target leaves a clean physical-state representation.
+# to_target/target_pos are computed relative to that episode's own randomly
+# placed built-in target, not a portable description of state across episodes.
 EXCLUDE_OBS_KEYS = {
     "reacher": {"to_target"},
-    "manipulator": {"target_pos"},  # verified: randomized per episode, same as reacher's to_target
+    "manipulator": {"target_pos"},
 }
 
 
 def flatten_obs(obs_dict, exclude=()) -> np.ndarray:
     if isinstance(obs_dict, dict):
         return np.concatenate([np.ravel(v) for k, v in sorted(obs_dict.items()) if k not in exclude]).astype(np.float32)
-    return np.asarray(obs_dict, dtype=np.float32)  # push_t's obs is already a flat vector
+    return np.asarray(obs_dict, dtype=np.float32)  # push_t's obs is already flat
 
 
 class RND:
-    """Random Network Distillation novelty scorer, used to greedily steer
-    exploration instead of acting i.i.d. random -- the fix for domains like
-    walker where random torque just jitters in place (Sec: action_repeat
-    alone wasn't enough). A fixed random target net + a predictor trained
-    online to match it on visited states: novelty = prediction error, which
-    is high on states rarely visited and decays as the predictor learns
-    them, pushing the greedy candidate search toward less-visited states.
-    One-step lookahead: at each real step, branch a few candidate actions
-    from the current physics state (dm_control lets us save/restore physics
-    state and step it directly, bypassing the env's episode bookkeeping),
-    score the resulting candidate observations, and commit to the most
-    novel one for real."""
+    """Random Network Distillation novelty scorer for greedy exploration.
+    Fixed random target net + online predictor; novelty = prediction error.
+    One-step lookahead: branch a few candidate actions from the current
+    physics state, score the resulting states, commit to the most novel."""
 
     def __init__(self, obs_dim, seed, hidden=128, dim=32, lr=1e-3):
         import jax
@@ -101,20 +75,10 @@ class RND:
 
 
 def _point_mass_maze_env(seed):
-    """point_mass with two offset walls forming an S-shaped corridor -- the
-    correctness gate in Sec 3.6 needs REAL walls: two states close in
-    Euclidean position but on opposite sides of a wall should show up as far
-    apart in the learned V_theta, and reaching one from the other requires
-    the long way around, which is exactly what a Euclidean-distance-based
-    (i.e. broken) value function could never represent.
-
-    Built by patching dm_control's own point_mass.xml rather than hand-
-    authoring a model: contacts are DISABLED by default in that file (the
-    point mass is normally confined only by joint limits, never actually
-    collides with anything, so the existing "walls" around the arena are
-    pure decoration) -- re-enable contacts and inject two wall geoms, then
-    reuse dm_control's own Physics/Task/Environment classes unmodified.
-    """
+    """point_mass with two offset walls forming an S-shaped corridor. Contacts
+    are disabled by default in dm_control's point_mass.xml (it's normally
+    confined only by joint limits), so the usual arena boundary is decorative;
+    this re-enables contacts and patches in real walls."""
     from dm_control.rl import control
     from dm_control.suite import common, point_mass
 
@@ -133,7 +97,7 @@ def _point_mass_maze_env(seed):
 
 
 class _GymTimeStep:
-    """Enough of dm_control's TimeStep for the rest of this codebase to not
+    """Enough of dm_control's TimeStep for the rest of the codebase to not
     care whether it's talking to dm_control or a gymnasium env."""
     def __init__(self, observation, done):
         self.observation = observation
@@ -152,11 +116,8 @@ class _BoxSpec:
 
 
 class _PushTPhysics:
-    """Just enough of dm_control's Physics interface for collect.py's qpos/
-    qvel recording and render.py's goal-teleport trick to work unchanged.
-    push_t's "physics" is two pymunk bodies (agent, block); qpos/qvel here
-    are just [agent_xy, block_xy, block_angle] and their time-derivatives,
-    packed the same way dm_control would pack a qpos/qvel pair."""
+    """dm_control's Physics interface, backed by push_t's two pymunk bodies.
+    qpos/qvel are [agent_xy, block_xy, block_angle] and their derivatives."""
     def __init__(self, raw_env):
         self._raw = raw_env
         self.data = argparse.Namespace(qpos=None, qvel=None)
@@ -176,8 +137,6 @@ class _PushTPhysics:
         self.forward()
 
     def forward(self):
-        """Pushes self.data.qpos/qvel (possibly just slice-assigned by a
-        caller, dm_control-style) back into the actual pymunk bodies."""
         u = self._raw
         qpos, qvel = self.data.qpos, self.data.qvel
         u.agent.position, u.block.position, u.block.angle = tuple(qpos[0:2]), tuple(qpos[2:4]), float(qpos[4])
@@ -193,9 +152,8 @@ class _PushTPhysics:
 
 class _PushTEnv:
     """Adapts gym-pusht's Gymnasium API to the dm_control-shaped interface
-    the rest of this codebase expects. Random exploration only: RND's
-    branched-physics lookahead would need to replicate push_t's internal PD
-    control loop exactly, which isn't done here."""
+    the rest of the codebase expects. Random exploration only: RND's branched
+    lookahead would need to replicate push_t's internal control loop."""
     def __init__(self, gym_env):
         self._env = gym_env
         self.physics = _PushTPhysics(gym_env.unwrapped)
@@ -209,7 +167,7 @@ class _PushTEnv:
         return _GymTimeStep(obs, False)
 
     def step(self, action):
-        obs, _, terminated, truncated, _ = self._env.step(action)  # reward discarded, same as everywhere else
+        obs, _, terminated, truncated, _ = self._env.step(action)
         self.physics.sync()
         return _GymTimeStep(obs, terminated or truncated)
 
@@ -219,15 +177,13 @@ class _PushTEnv:
 
 def _push_t_env(seed):
     import gymnasium as gym
-    import gym_pusht  # noqa: F401 -- registers the gym_pusht/PushT-v0 env id
+    import gym_pusht  # noqa: F401 -- registers gym_pusht/PushT-v0
     gym_env = gym.make("gym_pusht/PushT-v0", obs_type="state", render_mode="rgb_array")
-    gym_env.reset(seed=seed)  # gymnasium seeds via reset(), not construction; later resets continue the RNG stream
+    gym_env.reset(seed=seed)  # gymnasium seeds via reset(); later resets continue the stream
     return _PushTEnv(gym_env)
 
 
 def load_env(domain: str, task: str, seed=None):
-    """Every env construction in this codebase goes through here so the
-    maze and push_t special-cases live in one place."""
     if domain == "point_mass_maze":
         return _point_mass_maze_env(seed)
     if domain == "push_t":
@@ -238,16 +194,6 @@ def load_env(domain: str, task: str, seed=None):
 
 def collect(domain: str, task: str, num_episodes: int, episode_length: int, seed: int,
             action_repeat: int = 1, exploration: str = "random", rnd_candidates: int = 8):
-    """action_repeat > 1 holds each sampled action for several steps instead
-    of resampling i.i.d. every step. Pure i.i.d. random torque mostly jitters
-    torque-controlled joints around equilibrium without committing to a
-    direction (unlike a free-floating point mass, where i.i.d. forces still
-    integrate into real displacement) -- holding actions helps but isn't
-    enough on its own for domains like walker.
-
-    exploration="rnd" replaces i.i.d. random action selection with greedy
-    one-step-lookahead RND (see the RND class): still fully reward-free,
-    still stored the same way, just a smarter action-selection rule."""
     env = load_env(domain, task, seed)
     action_spec = env.action_spec()
     exclude = EXCLUDE_OBS_KEYS.get(domain, ())
@@ -293,11 +239,11 @@ def collect(domain: str, task: str, num_episodes: int, episode_length: int, seed
         for t in range(episode_length):
             if t % action_repeat == 0:
                 a = sample_action()
-            ts = env.step(a)  # reward from ts.reward is intentionally never used
+            ts = env.step(a)
             act[e, t] = a
             if rnd is not None:
-                rnd.learn(flatten_obs(ts.observation, exclude)[None])  # distill target on the state just visited
-            if ts.last():  # ran into the task's own time limit early -- restart
+                rnd.learn(flatten_obs(ts.observation, exclude)[None])
+            if ts.last():
                 ts = env.reset()
                 a = sample_action()
             record(e, t + 1, ts)
