@@ -22,6 +22,20 @@ from train import Config, Policy, scale_action
 
 SIZE = (240, 320)  # (height, width)
 
+# Several tasks' own original reward target (reacher's "target", point_mass's
+# "target", manipulator's "target_ball") is unrelated to our goal-conditioning
+# (we condition on a full state, not that marker) but still gets rendered,
+# showing a distracting, irrelevant ball at a random position. Hide it.
+_STRAY_TARGET_NAMES = ("target", "target_ball")
+
+
+def hide_stray_targets(env):
+    for name in _STRAY_TARGET_NAMES:
+        try:
+            env.physics.named.model.geom_rgba[name] = [0, 0, 0, 0]
+        except (KeyError, AttributeError):
+            pass  # push_t's physics shim has no .named; other domains just don't have this geom
+
 
 def label(frame, lines, color=(255, 255, 0)):
     img = Image.fromarray(frame)
@@ -51,6 +65,8 @@ def main(data_path, run_dir, episodes, horizon, tail, threshold, fps, out_dir, f
 
     env = load_env(domain, task)
     goal_env = load_env(domain, task)  # separate physics instance, teleported to render the goal
+    hide_stray_targets(env)
+    hide_stray_targets(goal_env)
     fps = fps or int(round(1.0 / env.control_timestep()))
     rng = np.random.default_rng(0)
     out = Path(out_dir)
